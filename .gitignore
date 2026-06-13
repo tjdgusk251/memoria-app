@@ -1,0 +1,20 @@
+# 비밀키 — 절대 커밋 금지
+.streamlit/secrets.toml
+
+# 로컬 데이터베이스 및 백업 (클라우드는 Turso 사용)
+*.db
+*.db.bak
+memoria_backup_*.db
+memoria_corrupted_*.db
+
+# 파이썬 캐시
+__pycache__/
+*.pyc
+
+# 작업 스냅샷 (배포에 불필요)
+versions/
+
+# OS/에디터
+.DS_Store
+.idea/
+.vscode/

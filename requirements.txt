@@ -1,0 +1,6 @@
+streamlit==1.57.0
+pandas==2.3.3
+numpy==2.4.0
+plotly==6.7.0
+PyPDF2==3.0.1
+libsql
