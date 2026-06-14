@@ -160,14 +160,10 @@ def ensure_user_column():
             conn.commit()
 
 
-HAS_REVIEW_COUNT = False   # 마이그레이션 성공 여부 — 실패해도 앱이 죽지 않게 분기에 사용
-
-
 def ensure_review_count_column():
     """복습 횟수(review_count) 컬럼 추가. review_count=0 이면 '아직 한 번도 복습 안 한 새 카드'로
     보고 '지금 복습' 대상에 항상 포함한다. 기존 카드는 1로 두어 유지율로만 판정한다.
-    어떤 이유로든 실패하면 HAS_REVIEW_COUNT=False 로 두고, 앱은 컬럼 없이도 동작한다."""
-    global HAS_REVIEW_COUNT
+    컬럼 보유 여부(True/False)를 반환 — 실패하면 False, 앱은 컬럼 없이도 동작한다."""
     try:
         with get_conn() as conn:
             cols = [r[1] for r in conn.execute("PRAGMA table_info(study_items)").fetchall()]
@@ -176,9 +172,9 @@ def ensure_review_count_column():
                 conn.commit()
                 conn.execute("UPDATE study_items SET review_count = 1 WHERE review_count IS NULL")
                 conn.commit()
-        HAS_REVIEW_COUNT = True
+        return True
     except Exception:
-        HAS_REVIEW_COUNT = False
+        return False
 
 
 def ensure_stability_column():
@@ -237,11 +233,18 @@ def ensure_qa_columns():
             conn.commit()
 
 
-init_db()
-ensure_stability_column()
-ensure_qa_columns()
-ensure_user_column()
-ensure_review_count_column()
+@st.cache_resource(show_spinner=False)
+def run_migrations_once():
+    """스키마 마이그레이션을 프로세스당 1회만 실행(매 rerun마다 Turso 왕복 방지).
+    review_count 컬럼 보유 여부를 반환한다."""
+    init_db()
+    ensure_stability_column()
+    ensure_qa_columns()
+    ensure_user_column()
+    return ensure_review_count_column()
+
+
+HAS_REVIEW_COUNT = run_migrations_once()
 
 
 # ============================================================
@@ -435,6 +438,7 @@ def start_review_session(rows_df, label):
 def invalidate_caches():
     get_unique_subjects.clear()
     query_items_from_db.clear()
+    count_all_items.clear()
 
 
 def grade_item(item_id, score_type, user_id):
@@ -459,7 +463,8 @@ def grade_item(item_id, score_type, user_id):
             (new_S, datetime.now().strftime("%Y-%m-%d"), item_id, user_id),
         )
         conn.commit()
-    invalidate_caches()
+    # 채점은 과목 목록·총개수를 바꾸지 않으므로 카드 조회 캐시만 새로고침(불필요한 Turso 왕복 절감)
+    query_items_from_db.clear()
     return old_S, new_S
 
 
@@ -566,6 +571,7 @@ def rename_subject_in_db(old_name, new_name, user_id):
     return moved
 
 
+@st.cache_data(ttl=300, show_spinner=False)
 def count_all_items(user_id):
     try:
         with get_conn() as conn:
