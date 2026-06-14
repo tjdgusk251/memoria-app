@@ -160,16 +160,25 @@ def ensure_user_column():
             conn.commit()
 
 
+HAS_REVIEW_COUNT = False   # 마이그레이션 성공 여부 — 실패해도 앱이 죽지 않게 분기에 사용
+
+
 def ensure_review_count_column():
     """복습 횟수(review_count) 컬럼 추가. review_count=0 이면 '아직 한 번도 복습 안 한 새 카드'로
-    보고 '지금 복습' 대상에 항상 포함한다. 기존 카드는 1로 두어 유지율로만 판정한다."""
-    with get_conn() as conn:
-        cols = [r[1] for r in conn.execute("PRAGMA table_info(study_items)").fetchall()]
-        if "review_count" not in cols:
-            conn.execute("ALTER TABLE study_items ADD COLUMN review_count INTEGER")
-            conn.commit()
-            conn.execute("UPDATE study_items SET review_count = 1 WHERE review_count IS NULL")
-            conn.commit()
+    보고 '지금 복습' 대상에 항상 포함한다. 기존 카드는 1로 두어 유지율로만 판정한다.
+    어떤 이유로든 실패하면 HAS_REVIEW_COUNT=False 로 두고, 앱은 컬럼 없이도 동작한다."""
+    global HAS_REVIEW_COUNT
+    try:
+        with get_conn() as conn:
+            cols = [r[1] for r in conn.execute("PRAGMA table_info(study_items)").fetchall()]
+            if "review_count" not in cols:
+                conn.execute("ALTER TABLE study_items ADD COLUMN review_count INTEGER")
+                conn.commit()
+                conn.execute("UPDATE study_items SET review_count = 1 WHERE review_count IS NULL")
+                conn.commit()
+        HAS_REVIEW_COUNT = True
+    except Exception:
+        HAS_REVIEW_COUNT = False
 
 
 def ensure_stability_column():
@@ -352,16 +361,21 @@ def get_unique_subjects(user_id):
 def query_items_from_db(user_id, subjects, start_date, end_date):
     """필터 조건의 카드를 조회하고 실시간 망각곡선 유지율을 계산해 반환.
     유지율이 시간에 따라 변하므로 retention 정렬은 SQL이 아닌 pandas에서 수행한다."""
+    # review_count 컬럼이 있으면 함께 조회, 없으면(마이그레이션 미완) 생략하고 1로 채움
+    rc_sql = ", review_count" if HAS_REVIEW_COUNT else ""
     select_cols = ["id", "subject", "topic", "retention", "last_date",
-                   "question", "answer", "stability", "qtype", "keywords", "review_count"]
-    base_cols = select_cols + ["elapsed_days"]
+                   "question", "answer", "stability", "qtype", "keywords"]
+    if HAS_REVIEW_COUNT:
+        select_cols = select_cols + ["review_count"]
+    base_cols = ["id", "subject", "topic", "retention", "last_date", "question",
+                 "answer", "stability", "qtype", "keywords", "review_count", "elapsed_days"]
     if not subjects:
         return pd.DataFrame(columns=base_cols)
     try:
         placeholders = ",".join("?" for _ in subjects)
         query = f"""
             SELECT id, subject, topic, retention, last_date, question, answer,
-                   stability, qtype, keywords, review_count
+                   stability, qtype, keywords{rc_sql}
             FROM study_items
             WHERE user_id = ?
               AND subject IN ({placeholders})
@@ -376,6 +390,8 @@ def query_items_from_db(user_id, subjects, start_date, end_date):
             rows = conn.execute(query, params).fetchall()
         # 드라이버 무관(로컬 sqlite3·클라우드 libsql 모두 호환)하도록 직접 DataFrame 구성
         df = pd.DataFrame(rows, columns=select_cols) if rows else pd.DataFrame(columns=select_cols)
+        if "review_count" not in df.columns:
+            df["review_count"] = 1                       # 컬럼 없을 때 기본값(=신규 아님)
 
         df = add_live_columns(df)                       # 실시간 유지율 계산
         if not df.empty:
@@ -436,9 +452,9 @@ def grade_item(item_id, score_type, user_id):
         ).fetchone()
         old_S = float(row[0]) if row and row[0] else DEFAULT_STABILITY
         new_S = min(S_MAX, max(S_MIN, old_S * GRADE_FACTORS.get(score_type, 1.0)))
+        rc_set = ", review_count = COALESCE(review_count, 0) + 1" if HAS_REVIEW_COUNT else ""
         conn.execute(
-            "UPDATE study_items SET stability = ?, retention = 100, last_date = ?, "
-            "review_count = COALESCE(review_count, 0) + 1 "
+            f"UPDATE study_items SET stability = ?, retention = 100, last_date = ?{rc_set} "
             "WHERE id = ? AND user_id = ?",
             (new_S, datetime.now().strftime("%Y-%m-%d"), item_id, user_id),
         )
@@ -499,15 +515,24 @@ def item_exists(subject, question, user_id):
 
 def insert_new_item(subject, topic, question, answer, user_id, qtype="short", keywords=None):
     kw = json.dumps(keywords, ensure_ascii=False) if keywords else None
+    now = datetime.now().strftime("%Y-%m-%d")
     with get_conn() as conn:
-        conn.execute(
-            """INSERT INTO study_items
-               (subject, topic, retention, last_date, question, answer,
-                stability, qtype, keywords, user_id, review_count)
-               VALUES (?, ?, 100, ?, ?, ?, ?, ?, ?, ?, 0)""",
-            (subject, topic, datetime.now().strftime("%Y-%m-%d"),
-             question, answer, DEFAULT_STABILITY, qtype, kw, user_id),
-        )
+        if HAS_REVIEW_COUNT:
+            conn.execute(
+                """INSERT INTO study_items
+                   (subject, topic, retention, last_date, question, answer,
+                    stability, qtype, keywords, user_id, review_count)
+                   VALUES (?, ?, 100, ?, ?, ?, ?, ?, ?, ?, 0)""",
+                (subject, topic, now, question, answer, DEFAULT_STABILITY, qtype, kw, user_id),
+            )
+        else:
+            conn.execute(
+                """INSERT INTO study_items
+                   (subject, topic, retention, last_date, question, answer,
+                    stability, qtype, keywords, user_id)
+                   VALUES (?, ?, 100, ?, ?, ?, ?, ?, ?, ?)""",
+                (subject, topic, now, question, answer, DEFAULT_STABILITY, qtype, kw, user_id),
+            )
         conn.commit()
     invalidate_caches()
 
