@@ -103,24 +103,32 @@ def _turso_creds():
     return url, token
 
 
-@contextmanager
-def get_conn():
-    """with 블록을 벗어나면 예외가 나도 반드시 connection을 닫는다.
-    Turso 접속정보가 있으면 클라우드(영구) DB, 없으면 로컬 SQLite 파일에 연결한다.
+@st.cache_resource(show_spinner=False)
+def _shared_conn():
+    """DB 연결을 프로세스당 1개만 만들어 재사용한다(매 작업마다 재접속/재인증하던 왕복 제거).
+    Turso 접속정보가 있으면 클라우드(영구) DB, 없으면 로컬 SQLite 파일.
     두 드라이버 모두 sqlite3 호환(? 플레이스홀더, execute/commit/fetchall)이라 쿼리는 동일하다."""
     url, token = _turso_creds()
     if url and token:
         import libsql
-        conn = libsql.connect(database=url, auth_token=token)
-    else:
-        conn = sqlite3.connect(DB_FILE)
+        return libsql.connect(database=url, auth_token=token)
+    return sqlite3.connect(DB_FILE, check_same_thread=False)
+
+
+@contextmanager
+def get_conn():
+    """캐시된 단일 연결을 재사용한다(닫지 않음 → 트래픽·지연 감소).
+    연결이 끊겨 오류가 나면 캐시를 비워 다음 호출에서 자동 재연결한다
+    — 별도의 헬스체크/핑(추가 트래픽) 없이 자가복구."""
+    conn = _shared_conn()
     try:
         yield conn
-    finally:
+    except Exception:
         try:
-            conn.close()
+            _shared_conn.clear()
         except Exception:
             pass
+        raise
 
 
 # ============================================================
@@ -244,7 +252,11 @@ def run_migrations_once():
     return ensure_review_count_column()
 
 
-HAS_REVIEW_COUNT = run_migrations_once()
+try:
+    HAS_REVIEW_COUNT = run_migrations_once()
+except Exception:
+    # 마이그레이션이 실패해도 앱이 'Oh no'로 죽지 않게 — 컬럼 없이도 동작하도록 degrade
+    HAS_REVIEW_COUNT = False
 
 
 # ============================================================
