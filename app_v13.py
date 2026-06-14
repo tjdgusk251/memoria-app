@@ -160,6 +160,18 @@ def ensure_user_column():
             conn.commit()
 
 
+def ensure_review_count_column():
+    """복습 횟수(review_count) 컬럼 추가. review_count=0 이면 '아직 한 번도 복습 안 한 새 카드'로
+    보고 '지금 복습' 대상에 항상 포함한다. 기존 카드는 1로 두어 유지율로만 판정한다."""
+    with get_conn() as conn:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(study_items)").fetchall()]
+        if "review_count" not in cols:
+            conn.execute("ALTER TABLE study_items ADD COLUMN review_count INTEGER")
+            conn.commit()
+            conn.execute("UPDATE study_items SET review_count = 1 WHERE review_count IS NULL")
+            conn.commit()
+
+
 def ensure_stability_column():
     """기존 DB에 안정성 S 컬럼이 없으면 추가하고, 옛 데이터를 자동 마이그레이션.
     저장돼 있던 retention과 경과일로부터 S를 역산하여 곡선이 자연스럽게 이어지게 한다.
@@ -220,6 +232,7 @@ init_db()
 ensure_stability_column()
 ensure_qa_columns()
 ensure_user_column()
+ensure_review_count_column()
 
 
 # ============================================================
@@ -336,11 +349,11 @@ def get_unique_subjects(user_id):
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def query_items_from_db(user_id, subjects, start_date, end_date, min_ret):
+def query_items_from_db(user_id, subjects, start_date, end_date):
     """필터 조건의 카드를 조회하고 실시간 망각곡선 유지율을 계산해 반환.
-    유지율이 시간에 따라 변하므로, retention 필터·정렬은 SQL이 아닌 pandas에서 수행한다."""
+    유지율이 시간에 따라 변하므로 retention 정렬은 SQL이 아닌 pandas에서 수행한다."""
     select_cols = ["id", "subject", "topic", "retention", "last_date",
-                   "question", "answer", "stability", "qtype", "keywords"]
+                   "question", "answer", "stability", "qtype", "keywords", "review_count"]
     base_cols = select_cols + ["elapsed_days"]
     if not subjects:
         return pd.DataFrame(columns=base_cols)
@@ -348,7 +361,7 @@ def query_items_from_db(user_id, subjects, start_date, end_date, min_ret):
         placeholders = ",".join("?" for _ in subjects)
         query = f"""
             SELECT id, subject, topic, retention, last_date, question, answer,
-                   stability, qtype, keywords
+                   stability, qtype, keywords, review_count
             FROM study_items
             WHERE user_id = ?
               AND subject IN ({placeholders})
@@ -366,7 +379,7 @@ def query_items_from_db(user_id, subjects, start_date, end_date, min_ret):
 
         df = add_live_columns(df)                       # 실시간 유지율 계산
         if not df.empty:
-            df = df[df["retention"] >= min_ret]         # 동적 유지율 기준 필터
+            df["review_count"] = df["review_count"].fillna(1).astype(int)
             df = df.sort_values("retention").reset_index(drop=True)
         return df
     except Exception as e:
@@ -424,7 +437,8 @@ def grade_item(item_id, score_type, user_id):
         old_S = float(row[0]) if row and row[0] else DEFAULT_STABILITY
         new_S = min(S_MAX, max(S_MIN, old_S * GRADE_FACTORS.get(score_type, 1.0)))
         conn.execute(
-            "UPDATE study_items SET stability = ?, retention = 100, last_date = ? "
+            "UPDATE study_items SET stability = ?, retention = 100, last_date = ?, "
+            "review_count = COALESCE(review_count, 0) + 1 "
             "WHERE id = ? AND user_id = ?",
             (new_S, datetime.now().strftime("%Y-%m-%d"), item_id, user_id),
         )
@@ -438,6 +452,24 @@ def next_interval_days(old_S, code):
     채점 후 S가 배수만큼 바뀌고, 유지율이 50%(반감기)로 떨어지는 시점을 다음 복습으로 본다."""
     new_S = min(S_MAX, max(S_MIN, old_S * GRADE_FACTORS.get(code, 1.0)))
     return max(1, round(new_S * math.log(2)))
+
+
+def days_until_due(stability, elapsed_days):
+    """유지율이 복습 기준(DUE_THRESHOLD %)으로 떨어질 때까지 남은 일수(대략)."""
+    S = max(0.1, float(stability or DEFAULT_STABILITY))
+    t_due = -S * math.log(DUE_THRESHOLD / 100.0)
+    return max(0, round(t_due) - int(elapsed_days))
+
+
+def split_due(df):
+    """카드를 '지금 복습'(due)과 '복습 예정'(아직)으로 나눈다.
+    due = 유지율이 기준 미만이거나, 아직 한 번도 복습 안 한 새 카드(review_count==0)."""
+    if df is None or df.empty:
+        empty = df
+        return empty, empty
+    is_new = df["review_count"].fillna(1).astype(int) == 0
+    due_mask = (df["retention"] < DUE_THRESHOLD) | is_new
+    return df[due_mask].copy(), df[~due_mask].copy()
 
 
 def parse_keywords(raw):
@@ -471,8 +503,8 @@ def insert_new_item(subject, topic, question, answer, user_id, qtype="short", ke
         conn.execute(
             """INSERT INTO study_items
                (subject, topic, retention, last_date, question, answer,
-                stability, qtype, keywords, user_id)
-               VALUES (?, ?, 100, ?, ?, ?, ?, ?, ?, ?)""",
+                stability, qtype, keywords, user_id, review_count)
+               VALUES (?, ?, 100, ?, ?, ?, ?, ?, ?, ?, 0)""",
             (subject, topic, datetime.now().strftime("%Y-%m-%d"),
              question, answer, DEFAULT_STABILITY, qtype, kw, user_id),
         )
@@ -725,9 +757,6 @@ with st.sidebar:
                 selected_subs.append(sub)
 
     st.markdown("---")
-    min_retention = st.slider("🎯 최소 기억 유지율 기준 설정 (%)", 0, 100, 0)
-
-    st.markdown("---")
     with st.expander("🩺 시스템 자가점검 (Self-Check)"):
         total_cards = count_all_items(USER_ID)
         checks = [
@@ -746,8 +775,8 @@ with st.sidebar:
         st.caption(
             "MEMORIA는 에빙하우스 망각곡선 R = 100·e^(-t/S)를 기반으로 "
             "기억 유지율을 시간에 따라 실시간 계산하고, 잊혀갈 카드를 자동으로 "
-            "상단에 띄워 복습을 유도하는 학습 리마인더입니다. 모든 데이터는 "
-            "SQLite(memoria.db)에 영구 저장됩니다."
+            "상단에 띄워 복습을 유도하는 학습 리마인더입니다. 데이터는 "
+            "계정별로 분리되어 클라우드 DB(또는 로컬)에 영구 저장됩니다."
         )
 
 
@@ -764,7 +793,7 @@ else:
     st.info("📅 조회 기간의 **시작일과 종료일**을 모두 선택하면 데이터가 표시됩니다.")
     start_d, end_d = today - timedelta(days=30), today
 
-filtered_df = query_items_from_db(USER_ID, selected_subs, start_d, end_d, min_retention)
+filtered_df = query_items_from_db(USER_ID, selected_subs, start_d, end_d)
 
 tab1, tab2, tab3, tab4 = st.tabs(
     ["📊 학습 통계", "📝 집중 복습 룸", "➕ 새 학습 카드 및 과목 관리", "🤖 AI 문제 출제"]
@@ -893,34 +922,51 @@ with tab2:
         if filtered_df.empty:
             st.info("복습할 카드가 없습니다. '🤖 AI 문제 출제' 또는 '➕ 새 학습 카드' 탭에서 먼저 카드를 만들어 보세요.")
         else:
-            decks = subject_summary(filtered_df)
-            due_total = int((filtered_df["retention"] < DUE_THRESHOLD).sum())
+            due_df, later_df = split_due(filtered_df)
 
-            head_l, head_r = st.columns([3, 1])
-            head_l.markdown(
-                f"#### 복습 대기 **{due_total}**장  ·  {len(decks)}과목\n"
-                f"유지율이 낮은 카드부터 한 장씩 집중해서 풉니다."
-            )
-            if head_r.button("▶ 전체 복습 시작", type="primary", use_container_width=True):
-                start_review_session(filtered_df, "전체 복습")
-                st.rerun()
+            # ── 지금 복습 (복습일이 된 카드 + 새 카드) ──
+            if due_df.empty:
+                st.success("🎉 지금 복습할 카드가 없습니다! 모두 기억이 충분히 남아 있어요.")
+            else:
+                decks = subject_summary(due_df)
+                head_l, head_r = st.columns([3, 1])
+                head_l.markdown(
+                    f"#### 🔴 지금 복습  **{len(due_df)}**장  ·  {len(decks)}과목\n"
+                    f"복습일이 됐거나 새로 만든 카드입니다. 유지율이 낮은 것부터 한 장씩 풉니다."
+                )
+                if head_r.button("▶ 지금 복습 시작", type="primary", use_container_width=True):
+                    start_review_session(due_df, "지금 복습")
+                    st.rerun()
 
-            st.markdown("##### 📚 과목별 덱")
-            cols_per_row = 3
-            for i in range(0, len(decks), cols_per_row):
-                row_decks = decks[i:i + cols_per_row]
-                cols = st.columns(cols_per_row)
-                for col, d in zip(cols, row_decks):
-                    with col, st.container(border=True):
-                        risk_txt = f"🔴 위험 {d['risk']}" if d["risk"] else "🟢 안정"
-                        st.markdown(f"**{d['subject']}**　{risk_txt}")
-                        st.progress(d["avg"] / 100, text=f"평균 유지율 {d['avg']}% · {d['count']}장")
-                        if st.button("복습 시작", key=f"deck_{d['subject']}", use_container_width=True):
-                            sub_df = filtered_df[filtered_df["subject"] == d["subject"]]
-                            start_review_session(sub_df, d["subject"])
-                            st.rerun()
+                st.markdown("##### 📚 과목별 덱")
+                cols_per_row = 3
+                for i in range(0, len(decks), cols_per_row):
+                    cols = st.columns(cols_per_row)
+                    for col, d in zip(cols, decks[i:i + cols_per_row]):
+                        with col, st.container(border=True):
+                            risk_txt = f"🔴 위험 {d['risk']}" if d["risk"] else "🟡 복습"
+                            st.markdown(f"**{d['subject']}**　{risk_txt}")
+                            st.progress(d["avg"] / 100, text=f"평균 유지율 {d['avg']}% · {d['count']}장")
+                            if st.button("복습 시작", key=f"deck_{d['subject']}", use_container_width=True):
+                                start_review_session(due_df[due_df["subject"] == d["subject"]], d["subject"])
+                                st.rerun()
 
-            # 보조: 카드 관리(목록·삭제) — 공부 흐름과 분리해 접어 둠
+            # ── 복습 예정 (아직 복습일 전) — 접어 둠 ──
+            if not later_df.empty:
+                with st.expander(f"⏳ 복습 예정 ({len(later_df)}장) — 아직 복습일 전"):
+                    upcoming = later_df.copy()
+                    upcoming["남은일"] = upcoming.apply(
+                        lambda r: days_until_due(r["stability"], r["elapsed_days"]), axis=1)
+                    upcoming = upcoming.sort_values("남은일")
+                    view = pd.DataFrame({
+                        "과목": upcoming["subject"],
+                        "토픽": upcoming["topic"],
+                        "현재 유지율": upcoming["retention"].astype(str) + "%",
+                        "복습 예정": "약 " + upcoming["남은일"].astype(str) + "일 후",
+                    })
+                    st.dataframe(view, use_container_width=True, hide_index=True)
+
+            # ── 보조: 카드 관리(목록·삭제) — 공부 흐름과 분리해 접어 둠 ──
             with st.expander("🗂 카드 관리 (목록 보기·삭제)"):
                 for _, row in filtered_df.iterrows():
                     c_txt, c_del = st.columns([6, 1])
