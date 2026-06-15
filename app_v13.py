@@ -366,8 +366,8 @@ def get_unique_subjects(user_id):
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def query_items_from_db(user_id, subjects, start_date, end_date):
-    """필터 조건의 카드를 조회하고 실시간 망각곡선 유지율을 계산해 반환.
+def query_items_from_db(user_id, subjects):
+    """선택한 과목의 카드를 조회하고 실시간 망각곡선 유지율을 계산해 반환.
     유지율이 시간에 따라 변하므로 retention 정렬은 SQL이 아닌 pandas에서 수행한다."""
     # review_count 컬럼이 있으면 함께 조회, 없으면(마이그레이션 미완) 생략하고 1로 채움
     rc_sql = ", review_count" if HAS_REVIEW_COUNT else ""
@@ -387,13 +387,8 @@ def query_items_from_db(user_id, subjects, start_date, end_date):
             FROM study_items
             WHERE user_id = ?
               AND subject IN ({placeholders})
-              AND date(last_date) >= date(?)
-              AND date(last_date) <= date(?)
         """
-        params = [user_id] + list(subjects) + [
-            start_date.strftime("%Y-%m-%d"),
-            end_date.strftime("%Y-%m-%d"),
-        ]
+        params = [user_id] + list(subjects)
         with get_conn() as conn:
             rows = conn.execute(query, params).fetchall()
         # 드라이버 무관(로컬 sqlite3·클라우드 libsql 모두 호환)하도록 직접 DataFrame 구성
@@ -773,15 +768,6 @@ with st.sidebar:
         st.session_state.pop("review_session", None)
         st.rerun()
     st.markdown("---")
-    st.markdown('<h2 style="color:#0061FF;">⚙️ 개인 맞춤 설정</h2>', unsafe_allow_html=True)
-    today = datetime.now().date()
-    date_range = st.date_input(
-        "📅 데이터 조회 기간 선택",
-        value=(today - timedelta(days=30), today),
-        key="date_filter",
-    )
-
-    st.markdown("---")
     st.markdown("##### 📚 복습 대상 과목 선택")
     db_subjects = get_unique_subjects(USER_ID)
     selected_subs = []
@@ -793,20 +779,6 @@ with st.sidebar:
                 selected_subs.append(sub)
 
     st.markdown("---")
-    with st.expander("🩺 시스템 자가점검 (Self-Check)"):
-        total_cards = count_all_items(USER_ID)
-        checks = [
-            ("DB 연결 정상", total_cards is not None),
-            ("학습 데이터 존재", bool(total_cards)),
-            ("등록된 과목 1개 이상", len(db_subjects) > 0),
-            ("PDF 파서 사용 가능", PYPDF2_OK),
-            ("조회 기간 정상 선택", isinstance(date_range, tuple) and len(date_range) == 2),
-            ("UTF-8 인코딩", sys.getdefaultencoding().lower() == "utf-8"),
-        ]
-        for label, ok in checks:
-            st.write(("✅ " if ok else "⚠️ ") + label)
-        st.caption(f"총 학습 카드: {total_cards if total_cards is not None else '확인 불가'}개")
-
     with st.expander("ℹ️ 시스템 소개"):
         st.caption(
             "MEMORIA는 에빙하우스 망각곡선 R = 100·e^(-t/S)를 기반으로 "
@@ -823,13 +795,7 @@ st.markdown('<h1 class="header-title">🧠 MEMORIA</h1>', unsafe_allow_html=True
 st.caption("망각곡선 기반 데이터베이스 자동 연동 학습 관리 시스템")
 st.markdown("<br>", unsafe_allow_html=True)
 
-if isinstance(date_range, tuple) and len(date_range) == 2:
-    start_d, end_d = date_range
-else:
-    st.info("📅 조회 기간의 **시작일과 종료일**을 모두 선택하면 데이터가 표시됩니다.")
-    start_d, end_d = today - timedelta(days=30), today
-
-filtered_df = query_items_from_db(USER_ID, selected_subs, start_d, end_d)
+filtered_df = query_items_from_db(USER_ID, selected_subs)
 
 tab1, tab2, tab3, tab4 = st.tabs(
     ["📊 학습 통계", "📝 집중 복습 룸", "➕ 새 학습 카드 및 과목 관리", "🤖 AI 문제 출제"]
