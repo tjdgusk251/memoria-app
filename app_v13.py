@@ -103,32 +103,25 @@ def _turso_creds():
     return url, token
 
 
-@st.cache_resource(show_spinner=False)
-def _shared_conn():
-    """DB 연결을 프로세스당 1개만 만들어 재사용한다(매 작업마다 재접속/재인증하던 왕복 제거).
+@contextmanager
+def get_conn():
+    """작업마다 연결을 새로 열고, with 블록을 벗어나면 예외가 나도 반드시 닫는다.
     Turso 접속정보가 있으면 클라우드(영구) DB, 없으면 로컬 SQLite 파일.
-    두 드라이버 모두 sqlite3 호환(? 플레이스홀더, execute/commit/fetchall)이라 쿼리는 동일하다."""
+    두 드라이버 모두 sqlite3 호환(? 플레이스홀더, execute/commit/fetchall)이라 쿼리는 동일하다.
+    (연결 캐싱은 클라우드 멀티스레드에서 충돌 위험이 있어 사용하지 않는다.)"""
     url, token = _turso_creds()
     if url and token:
         import libsql
-        return libsql.connect(database=url, auth_token=token)
-    return sqlite3.connect(DB_FILE, check_same_thread=False)
-
-
-@contextmanager
-def get_conn():
-    """캐시된 단일 연결을 재사용한다(닫지 않음 → 트래픽·지연 감소).
-    연결이 끊겨 오류가 나면 캐시를 비워 다음 호출에서 자동 재연결한다
-    — 별도의 헬스체크/핑(추가 트래픽) 없이 자가복구."""
-    conn = _shared_conn()
+        conn = libsql.connect(database=url, auth_token=token)
+    else:
+        conn = sqlite3.connect(DB_FILE)
     try:
         yield conn
-    except Exception:
+    finally:
         try:
-            _shared_conn.clear()
+            conn.close()
         except Exception:
             pass
-        raise
 
 
 # ============================================================
