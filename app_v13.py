@@ -602,7 +602,7 @@ def extract_text_from_pdf(uploaded_file):
 #      앱이 LLM을 직접 호출하지 않고, 외부 AI에게 줄 '주문서'를 만들어 주고
 #      그 결과(JSON)를 받아 카드로 등록한다(비용 0, 품질↑, 형식 강제로 안정).
 # ============================================================
-DOC_TYPES = ["교과서", "강의 필기", "논문/아티클", "요약 정리본", "기타"]
+DOC_TYPES = ["교과서", "강의 필기", "논문/아티클", "요약 정리본"]
 DIFFICULTIES = ["쉬움", "보통", "어려움"]
 # 난이도 → 블룸 분류(Anderson & Krathwohl, 2001) 인지 수준별 실제 출제 지시
 DIFFICULTY_BLOOM = {
@@ -1117,12 +1117,15 @@ with tab4:
                 "*(비워 두면 '핵심 내용 전반 복습'으로 자동 설정됩니다.)*"
             )
 
-        doc_choice = st.selectbox("자료 종류", DOC_TYPES + ["✏️ 직접 입력"], key="gen_doctype")
-        if doc_choice == "✏️ 직접 입력":
+        doc_choice = st.selectbox("자료 종류", DOC_TYPES + ["기타 (목록에 없음 → 아래에 직접 입력)"],
+                                  key="gen_doctype")
+        if doc_choice.startswith("기타"):
             p_doctype = st.text_input(
-                "자료 종류 직접 입력", placeholder="예: 판례, 실험 매뉴얼, 문제집 해설, 코드 주석",
+                "└ 여기에 자료 종류를 직접 입력하세요",
+                placeholder="예: 판례, 실험 매뉴얼, 문제집 해설, 코드 주석",
                 key="gen_doctype_custom",
             ).strip() or "기타"
+            st.caption("위에서 ‘기타’를 선택하셨습니다. 위 칸에 자료 종류를 적어 주세요.")
         else:
             p_doctype = doc_choice
         p_diff = st.selectbox("난이도", DIFFICULTIES, index=1, key="gen_diff",
